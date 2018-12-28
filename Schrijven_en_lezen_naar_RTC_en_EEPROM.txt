@@ -1,0 +1,735 @@
+#include "evk1100.h"
+#include <asf.h>
+
+#include "print_funcs.h"
+#include "pm.h"
+#include "string.h"
+
+#define PB0						GPIO_PUSH_BUTTON_0			// Push button 0 definition
+#define PB1						GPIO_PUSH_BUTTON_1			// Push button 1 definition
+#define PB2						GPIO_PUSH_BUTTON_2			// Push button 2 definition
+
+#define RTC_ADDRESS				0x68						// RTC's TWI address
+#define TWI_SPEED				FOSC32						// Speed of TWI communication
+#define usart1					&AVR32_USART1				// Definition for USART1 communication
+
+//static const gpio_map_t ADC_GPIO_MAP = {{ADC_POTENTIOMETER_PIN, ADC_POTENTIOMETER_FUNCTION}, {ADC_LIGHT_PIN, ADC_LIGHT_FUNCTION}, {ADC_TEMPERATURE_PIN, ADC_TEMPERATURE_FUNCTION}};
+static const gpio_map_t POT_GPIO_MAP = {{AVR32_ADC_AD_1_PIN, AVR32_ADC_AD_1_FUNCTION}};
+static const gpio_map_t USART1_GPIO_MAP = {{AVR32_USART1_RXD_0_0_PIN, AVR32_USART1_RXD_0_0_FUNCTION}, {AVR32_USART1_TXD_0_0_PIN, AVR32_USART1_TXD_0_0_FUNCTION}};
+static const gpio_map_t DIP204_SPI_GPIO_MAP = {{DIP204_SPI_SCK_PIN,  DIP204_SPI_SCK_FUNCTION }, {DIP204_SPI_MISO_PIN, DIP204_SPI_MISO_FUNCTION}, {DIP204_SPI_MOSI_PIN, DIP204_SPI_MOSI_FUNCTION}, {DIP204_SPI_NPCS_PIN, DIP204_SPI_NPCS_FUNCTION}};
+static const gpio_map_t TWI_GPIO_MAP = {{AVR32_TWI_SDA_0_0_PIN, AVR32_TWI_SDA_0_0_FUNCTION},{AVR32_TWI_SCL_0_0_PIN, AVR32_TWI_SCL_0_0_FUNCTION}};
+
+static const usart_options_t USART_OPTIONS = {.baudrate = 115200,.charlength = 8,.paritytype = USART_NO_PARITY,.stopbits = USART_1_STOPBIT,.channelmode = USART_NORMAL_CHMODE};
+static const spi_options_t SPI_OPTIONS = {.reg = DIP204_SPI_NPCS,.baudrate = 120000,.bits = 8,.spck_delay = 0,.trans_delay = 0,.stay_act = 1,.spi_mode = 0,.modfdis = 1};
+//static const twi_options_t TWI_OPTIONS = {.pba_hz = FOSC0,.speed = TWI_SPEED,.chip = RTC_ADDRESS};
+
+twi_options_t opt;
+twi_package_t packet_received, packet_send, packet_EEPROM_send, packet_EEPROM_received;
+
+void var_delay_ms(int);
+void Light_sensor(void);
+void Temperature_sensor(void);
+
+void Potmeter_control(void);
+int  Potmeter_value(void);
+char* itoa(int);
+static void Joy_int_handler(void);
+static void PB_int_handler(void);
+void set_time(void);
+void display_time(void);
+char bcd_to_decimal(char);
+char decimal_to_bcd(char);
+void Number_to_Month(int);
+void Number_to_DAY(int);
+
+void Write_RTC(void);
+void Read_RTC(void);
+
+int adc_value_light = 0;
+int adc_value_temp  = 0;
+signed short adc_value_pot   = -1;
+
+void display_1(int, char*);
+void display_2(int, char*);
+void display_3(int, char*);
+void display_4(int, char*);
+
+void TWI_MASTER_EEPROM(void);
+void Read_EEPROM(void);
+void Write_EEPROM(void);
+
+int x = 1;
+int y = 1;
+int Button_cases = 1;
+int time_uitgang[ 5 ];
+int joy_button = 0;
+int pot_value = 0;
+int poort_number = 1;
+
+uint8_t tbuffer[9];
+
+void var_delay_ms(int mills) {
+	delay_ms(mills * (FOSC0/AVR32_PM_RCOSC_FREQUENCY));
+}
+char bcd_to_decimal(char d){
+	return ((d & 0x0F) + (((d & 0xF0) >> 4) * 10));
+	
+	/*display_2(1,itoa((tbuffer[0] & 0x0f)+((tbuffer[0] & 0xf0)>>4)*10));		
+	display_2(4,itoa((tbuffer[1] & 0x0f)+((tbuffer[1] & 0xf0)>>4)*10));			
+	display_2(7,itoa((tbuffer[2] & 0x0f)+(((tbuffer[2] & 0x10)+(tbuffer[2]&0x20))>>4)*10));			
+	display_2(10,itoa((tbuffer[3] & 0x07)));				
+	display_2(13,itoa((tbuffer[4] & 0x0f)+((tbuffer[4] & 0xf0)>>4)*10));				
+	display_2(16,itoa((tbuffer[5] & 0x0f)+((tbuffer[5] & 0xf0)>>4)*10));	
+	display_2(19,itoa((tbuffer[6] & 0x0f)+((tbuffer[6] & 0xf0)>>4)*10+((tbuffer[5] & 0x80)>>7)*100 + 1900));*/					
+}
+char decimal_to_bcd(char d){
+	return (((d / 10) << 4) & 0xF0) | ((d % 10) & 0x0F);
+}
+char* itoa(int i){
+	char const digit[] = "0123456789";
+	char* p = 10;
+	if(i<0){
+		*p++ = '-';
+		i *= -1;
+	}
+	int shifter = i;
+	do{ //Move to where representation ends
+		++p;
+		shifter = shifter/10;
+	}while(shifter);
+	*p = '\0';
+	do{ //Move back, inserting digits as u go
+		*--p = digit[i%10];
+		i = i/10;
+	}while(i);
+	return 10;
+}
+
+void INIT()
+{
+	//CLOCK init
+	pm_switch_to_osc0(&AVR32_PM, FOSC0, OSC0_STARTUP);
+	pcl_switch_to_osc(PCL_OSC0, FOSC0, OSC0_STARTUP);
+	sysclk_init();
+
+	irq_initialize_vectors();
+	cpu_irq_enable();
+	
+	//enable modules
+	gpio_enable_module(DIP204_SPI_GPIO_MAP, 4);
+	gpio_enable_module(POT_GPIO_MAP, 2);
+	gpio_enable_module(USART1_GPIO_MAP, 2);
+	gpio_enable_module(TWI_GPIO_MAP, 2);
+	
+	//SPI Display init
+	spi_initMaster(DIP204_SPI, &SPI_OPTIONS);
+	spi_selectionMode(DIP204_SPI, 0, 0, 0);
+	spi_setupChipReg(DIP204_SPI, &SPI_OPTIONS, FOSC0);
+	spi_enable(DIP204_SPI);
+	dip204_init(backlight_PWM, true);
+	
+	//ADC init
+	AVR32_ADC.mr |= 0x1 << AVR32_ADC_MR_PRESCAL_OFFSET;
+	adc_configure(&AVR32_ADC);
+	adc_enable(&AVR32_ADC, 1);
+	
+	//USART init
+	usart_init_rs232(usart1, &USART_OPTIONS, FOSC0);
+	
+	//TWI init
+	//twi_master_init(&AVR32_TWI, &TWI_OPTIONS);
+	opt.pba_hz = FOSC0;
+	opt.speed = TWI_SPEED;
+	
+	//Configure_joystick_IT();
+	gpio_enable_pin_interrupt(GPIO_JOYSTICK_UP , GPIO_FALLING_EDGE);
+	gpio_enable_pin_interrupt(GPIO_JOYSTICK_DOWN , GPIO_FALLING_EDGE);
+	gpio_enable_pin_interrupt(GPIO_JOYSTICK_RIGHT , GPIO_FALLING_EDGE);
+	gpio_enable_pin_interrupt(GPIO_JOYSTICK_PUSH , GPIO_FALLING_EDGE);
+	gpio_enable_pin_interrupt(GPIO_JOYSTICK_LEFT , GPIO_FALLING_EDGE);
+
+	Disable_global_interrupt();
+	INTC_register_interrupt( &Joy_int_handler, AVR32_GPIO_IRQ_0 + (GPIO_JOYSTICK_UP/8), AVR32_INTC_INT1);
+	INTC_register_interrupt( &Joy_int_handler, AVR32_GPIO_IRQ_0 + (GPIO_JOYSTICK_DOWN/8), AVR32_INTC_INT1);
+	INTC_register_interrupt( &Joy_int_handler, AVR32_GPIO_IRQ_0 + (GPIO_JOYSTICK_RIGHT/8), AVR32_INTC_INT1);
+	INTC_register_interrupt( &Joy_int_handler, AVR32_GPIO_IRQ_0 + (GPIO_JOYSTICK_LEFT/8), AVR32_INTC_INT1);
+	INTC_register_interrupt( &Joy_int_handler, AVR32_GPIO_IRQ_0 + (GPIO_JOYSTICK_PUSH/8), AVR32_INTC_INT1);
+	Enable_global_interrupt();
+		
+	//configure_push_buttons_IT();
+	gpio_enable_pin_interrupt(PB0 , GPIO_RISING_EDGE);
+	gpio_enable_pin_interrupt(PB1 , GPIO_RISING_EDGE);
+	gpio_enable_pin_interrupt(PB2 , GPIO_RISING_EDGE);
+
+	Disable_global_interrupt();
+	INTC_register_interrupt( &PB_int_handler, AVR32_GPIO_IRQ_0 + (PB2/8), AVR32_INTC_INT1);
+	INTC_register_interrupt( &PB_int_handler, AVR32_GPIO_IRQ_0 + (PB1/8), AVR32_INTC_INT1);
+	INTC_register_interrupt( &PB_int_handler, AVR32_GPIO_IRQ_0 + (PB0/8), AVR32_INTC_INT1);
+	Enable_global_interrupt();
+}
+
+int main(void)
+{
+	INIT();
+	TWI_MASTER_EEPROM();
+	Read_EEPROM();
+	Write_EEPROM();
+	
+	while (1){
+		Read_RTC();
+		
+				
+		Joy_int_handler();
+		PB_int_handler();
+		Potmeter_control();
+		dip204_clear_display();
+		
+		switch(Button_cases){
+			case 2:
+			display_3(1, "Poort  : --:--:--:--");
+			set_time();
+			Write_EEPROM();
+			break;
+			
+			case 3:
+			display_time();
+			break;
+						
+			case 1:
+			display_1(2,"DS3231:");
+			display_2(1,"Time: --:--:--");
+			display_3(1,"Date: - -- --- 20--");
+			dip204_set_cursor_position(y,x);
+			int place = 13;
+			for(int i = 0; i < 3 ; i ++){
+				display_2(place,itoa((bcd_to_decimal(tbuffer[i])) / 10 % 10));
+				display_2((place+1),itoa((bcd_to_decimal(tbuffer[i])) % 10));
+				place = place - 3;
+			}
+			display_3(7,itoa(bcd_to_decimal(tbuffer[3])));
+			
+			display_3(9,itoa((bcd_to_decimal(tbuffer[4])) / 10 % 10));
+			display_3((10),itoa((bcd_to_decimal(tbuffer[4])) % 10));	
+			
+			Number_to_Month(bcd_to_decimal(tbuffer[5]));
+			
+			display_3(18,itoa((bcd_to_decimal(tbuffer[6])) / 10 % 10));
+			display_3((19),itoa((bcd_to_decimal(tbuffer[6])) % 10));
+			
+			display_4(2,"Today is ");
+			Number_to_DAY(bcd_to_decimal(tbuffer[3]));
+				
+			if(joy_button == 1){ 
+				Write_RTC(); 
+				display_1(10,"Change ON");
+			}
+			else{
+				display_1(10,"Change OFF");
+			}
+			break;
+			
+		}
+		dip204_set_cursor_position(y,x);
+		var_delay_ms(200);
+	}
+	return 0;
+}
+
+void display_1(int pos_1, char* string_1){
+	dip204_set_cursor_position(pos_1,1);
+	dip204_write_string(string_1);
+}
+void display_2(int pos_2, char* string_2){
+	dip204_set_cursor_position(pos_2,2);
+	dip204_write_string(string_2);
+}
+void display_3(int pos_3, char* string_3){
+	dip204_set_cursor_position(pos_3,3);
+	dip204_write_string(string_3);
+}
+void display_4(int pos_4, char* string_4){
+	dip204_set_cursor_position(pos_4,4);
+	dip204_write_string(string_4);
+}
+void Potmeter_control(void)
+{
+	adc_enable(&AVR32_ADC, ADC_POTENTIOMETER_CHANNEL);
+	adc_start(&AVR32_ADC);
+	adc_value_pot = adc_get_value(&AVR32_ADC, ADC_POTENTIOMETER_CHANNEL);
+	adc_disable(&AVR32_ADC, ADC_POTENTIOMETER_CHANNEL);
+}
+int Potmeter_value(void)
+{
+	adc_enable(&AVR32_ADC, ADC_POTENTIOMETER_CHANNEL);
+	adc_start(&AVR32_ADC);
+	adc_value_pot = adc_get_value(&AVR32_ADC, ADC_POTENTIOMETER_CHANNEL);
+	adc_disable(&AVR32_ADC, ADC_POTENTIOMETER_CHANNEL);
+	
+	return (adc_value_pot / 103 % 10);
+}
+static void Joy_int_handler(){
+	if (gpio_get_pin_interrupt_flag(GPIO_JOYSTICK_UP)){
+		var_delay_ms(1);
+		x = x - 1;
+		if (x < 1){
+			x = 4;
+		}
+		gpio_clear_pin_interrupt_flag(GPIO_JOYSTICK_UP); // allow new interrupt : clear the IFR flag
+	}
+	if (gpio_get_pin_interrupt_flag(GPIO_JOYSTICK_DOWN)){
+		x = x + 1;
+		if (x > 4){
+			x = 1;
+		}
+		gpio_clear_pin_interrupt_flag(GPIO_JOYSTICK_DOWN); // allow new interrupt : clear the IFR flag
+	}
+	if (gpio_get_pin_interrupt_flag(GPIO_JOYSTICK_LEFT)){
+		y = y - 1;
+		if (y < 1){
+			y = 20;
+		}
+		gpio_clear_pin_interrupt_flag(GPIO_JOYSTICK_LEFT); // allow new interrupt : clear the IFR flag
+	}
+	if (gpio_get_pin_interrupt_flag(GPIO_JOYSTICK_RIGHT)){
+		y = y + 1;
+		if (y > 20){
+			y = 1;
+		}
+		gpio_clear_pin_interrupt_flag(GPIO_JOYSTICK_RIGHT); // allow new interrupt : clear the IFR flag
+	}
+	
+	if (gpio_get_pin_interrupt_flag(GPIO_JOYSTICK_PUSH)){ // change time when pushed
+		joy_button = joy_button + 1;
+		if (joy_button > 1){
+			joy_button = 0;
+		}
+		gpio_clear_pin_interrupt_flag(GPIO_JOYSTICK_PUSH);  // allow new interrupt : clear the IFR flag
+	}
+	var_delay_ms(1);
+}
+static void PB_int_handler(){
+	if (gpio_get_pin_interrupt_flag(PB0)){
+		Button_cases = Button_cases + 1;
+		if (Button_cases == 4){
+			Button_cases = 1;
+		}
+		gpio_clear_pin_interrupt_flag(PB0);
+	}
+
+	if (gpio_get_pin_interrupt_flag(PB1)){
+		Button_cases = 2;
+		gpio_clear_pin_interrupt_flag(PB1);
+	}
+
+	if (gpio_get_pin_interrupt_flag(PB2)){
+		Button_cases = 3;
+		gpio_clear_pin_interrupt_flag(PB2);
+	}
+	
+	var_delay_ms(1);
+}
+void Light_sensor(void)
+{
+	adc_enable(&AVR32_ADC, ADC_LIGHT_CHANNEL);
+	adc_start(&AVR32_ADC);
+	adc_value_light = adc_get_value(&AVR32_ADC, ADC_LIGHT_CHANNEL);
+	
+	if (adc_value_light > 512){LED_On(0x02);}
+	else{LED_Off(0x02);}
+	adc_disable(&AVR32_ADC, ADC_LIGHT_CHANNEL);
+}
+void Temperature_sensor(void)
+{
+	adc_enable(&AVR32_ADC, ADC_TEMPERATURE_CHANNEL);
+	adc_start(&AVR32_ADC);
+	adc_value_temp = adc_get_value(&AVR32_ADC, ADC_TEMPERATURE_CHANNEL);
+	if (adc_value_temp > 512){LED_On(0x04);}
+	else{LED_Off(0x04);}
+	adc_disable(&AVR32_ADC, ADC_TEMPERATURE_CHANNEL);
+}
+void Number_to_Month(int Number){
+	switch(Number){
+		case 1:
+		display_3(12,"JAN");
+		break;
+		case 2:
+		display_3(12,"FEB");
+		break;
+		case 3:
+		display_3(12,"MAR");
+		break;
+		case 4:
+		display_3(12,"APR");
+		break;
+		case 5:
+		display_3(12,"MAY");
+		break;
+		case 6:
+		display_3(12,"JUN");
+		break;
+		case 7:
+		display_3(12,"JUL");
+		break;
+		case 8:
+		display_3(12,"AUG");
+		break;
+		case 9:
+		display_3(12,"SEP");
+		break;
+		case 10:
+		display_3(12,"OCT");
+		break;
+		case 11:
+		display_3(12,"NOV");
+		break;	
+		case 12:
+		display_3(12,"DEC");
+		break;	
+	}
+}
+void Number_to_DAY(int Number){
+	switch(Number){
+		case 1:
+		display_4(11,"Monday :(");
+		break;
+		case 2:
+		display_4(11,"Tuesday");
+		break;
+		case 3:
+		display_4(11,"Wednesday");
+		break;
+		case 4:
+		display_4(11,"Thursday");
+		break;
+		case 5:
+		display_4(11,"Friday");
+		break;
+		case 6:
+		display_4(11,"Saturday");
+		break;
+		case 7:
+		display_4(11,"Sunday :)");
+		break;
+	}
+}
+
+void Read_RTC(void){
+	opt.chip = RTC_ADDRESS;
+	twi_master_init(&AVR32_TWI, &opt);
+		
+	packet_received.chip = 0x68;
+	packet_received.addr_length = sizeof (uint8_t);
+	packet_received.length = 16;
+	packet_received.addr[0] = 0x00;
+	packet_received.buffer = &tbuffer;
+	twi_master_read(&AVR32_TWI, &packet_received);
+}
+void Write_RTC(void){
+	packet_received.chip = 0b01101000;
+	packet_received.addr_length = sizeof (uint8_t);
+	packet_received.length = 7;
+	packet_received.addr[0] = 0x00;
+	packet_received.buffer = &tbuffer;
+	twi_master_read(&AVR32_TWI, &packet_received);
+	
+	int time_h = (bcd_to_decimal(tbuffer[2])) / 10 % 10;
+	int time_hh = (bcd_to_decimal(tbuffer[2])) % 10;
+	int time_m = (bcd_to_decimal(tbuffer[1])) / 10 % 10;
+	int time_mm = (bcd_to_decimal(tbuffer[1])) % 10;
+	int time_s = (bcd_to_decimal(tbuffer[0])) / 10 % 10;
+	int time_ss = (bcd_to_decimal(tbuffer[0])) % 10;
+	
+	int time_day = bcd_to_decimal(tbuffer[3]);
+	int time_d = (bcd_to_decimal(tbuffer[4])) / 10 % 10;
+	int time_dd = (bcd_to_decimal(tbuffer[4])) % 10;
+	int time_month = (bcd_to_decimal(tbuffer[5])) ;
+	int time_y = (bcd_to_decimal(tbuffer[6])) / 10 % 10;
+	int time_yy = (bcd_to_decimal(tbuffer[6])) % 10;
+	
+	if(joy_button == 1 && x == 2){
+		switch(y){
+			case 7:
+			if(Potmeter_value() > 2){ time_h = 2; }
+			else{ time_h = Potmeter_value(); }
+			break;
+			
+			case 8:
+			if(Potmeter_value() > 3){ time_hh = 3; }
+			else{ time_hh = Potmeter_value(); }
+			break;
+			
+			case 10:
+			if(Potmeter_value() > 5){ time_m = 5; }
+			else{ time_m = Potmeter_value(); }
+			break;
+			
+			case 11:
+			time_mm = Potmeter_value();
+			break;
+			
+			case 13:
+			if(Potmeter_value() > 5){ time_s = 5; }
+			else{ time_s = Potmeter_value(); }
+			break;
+			
+			case 14:
+			time_ss = Potmeter_value();
+			break;
+		}
+		tbuffer[2] = decimal_to_bcd(time_h * 10 + time_hh);
+		tbuffer[1] = decimal_to_bcd(time_m * 10 + time_mm);
+		tbuffer[0] = decimal_to_bcd(time_s * 10 + time_ss);
+	}
+	
+	if(joy_button == 1 && x == 3){
+		switch(y){
+			case 7:
+			if(Potmeter_value() > 7){ time_day = 7; }
+			else if(Potmeter_value() == 0){ time_day = 1; }
+			else{ time_day = Potmeter_value(); }
+			break;
+			
+			case 9:	
+			if(Potmeter_value() == 0 && time_dd == 0){ time_dd = 1;}
+			if(Potmeter_value() > 3){ time_d = 3; if(time_dd > 1 ){time_dd = 1;} }
+			else{ time_d = Potmeter_value(); }
+			break;
+			
+			case 10:
+			if (Potmeter_value() == 0 && time_d == 0){time_dd = 1;}
+			else if(time_d == 3 && Potmeter_value() > 1){ time_dd = 1; }
+			else if(time_d == 3 && Potmeter_value() == 0){ time_dd = 0; }
+			else{ time_dd = Potmeter_value(); }
+			break; 
+						
+			case 18:
+			time_y = Potmeter_value();
+			break;
+			
+			case 19:
+			time_yy = Potmeter_value();
+			break;
+		}
+		
+		if(y > 11 && y < 15){
+			time_month = adc_value_pot / 93 % 12 + 1;
+			Number_to_Month(time_month);
+		}
+		
+		
+		tbuffer[3] = decimal_to_bcd(time_day);
+		tbuffer[4] = decimal_to_bcd(time_d * 10 + time_dd);
+		tbuffer[5] = decimal_to_bcd(time_month);
+		tbuffer[6] = decimal_to_bcd(time_y * 10 + time_yy);
+		
+	}
+	
+	packet_send.chip = 0b01101000;
+	packet_send.addr_length = sizeof (uint8_t);
+	packet_send.length = 16;
+	packet_send.addr[0] = 0x00;
+	packet_send.buffer = &tbuffer;
+	twi_master_write(&AVR32_TWI, &packet_send);
+}
+
+void set_time(void){
+	if(joy_button == 1){ display_1(2,"Change poort (ON)"); }
+	else{ display_1(2,"Change poort (OFF)"); }	
+		
+	int time_20 = time_uitgang[poort_number] % 60 % 10;
+	int time_19 = time_uitgang[poort_number] % 60 / 10 % 10;
+	int time_17 = (time_uitgang[poort_number] / 60) % 60 % 10;
+	int time_16 = (time_uitgang[poort_number] / 60) % 60 / 10 % 10;
+	int time_14 = (time_uitgang[poort_number] / 3600) % 60 % 10;
+	int time_13 = (time_uitgang[poort_number] / 3600) % 60 / 10 % 10;
+	int time_11 = (time_uitgang[poort_number] / 216000) % 24 % 10;
+	int time_10 = (time_uitgang[poort_number] / 216000) % 24 / 10 % 10;
+	
+	display_3(7, itoa(poort_number));
+	display_3(10, itoa((time_uitgang[poort_number] / 216000) % 24 / 10 % 10));
+	display_3(11, itoa((time_uitgang[poort_number] / 216000) % 24 % 10));
+	display_3(13, itoa((time_uitgang[poort_number] / 3600) % 60 / 10 % 10));
+	display_3(14, itoa((time_uitgang[poort_number] / 3600) % 60 % 10));
+	display_3(16, itoa((time_uitgang[poort_number] / 60) % 60 / 10 % 10));
+	display_3(17, itoa((time_uitgang[poort_number] / 60) % 60 % 10));
+	display_3(19, itoa(time_uitgang[poort_number] % 60 / 10 % 10));
+	display_3(20, itoa(time_uitgang[poort_number] % 60 % 10));
+	
+	if(joy_button == 1 && x == 3 && y == 7){ poort_number = (Potmeter_value()/3%4 + 1); }
+	else if(joy_button == 1 && x == 3 && y > 9){
+		switch(y){	
+			case 10:
+			if(Potmeter_value() > 2){ time_10 = 2; }
+			else{ time_10 = Potmeter_value();}
+			//time_uitgang[poort_number] = time_uitgang[poort_number] + time_10 * 10 * 60 * 60 * 60;
+			break;
+			case 11:
+			if(Potmeter_value() > 3){ time_11 = 3; }
+			else{ time_11 = Potmeter_value();}
+			//time_uitgang[poort_number] = time_uitgang[poort_number] + time_11 * 60 * 60 * 60;
+			break;
+			case 13:
+			if(Potmeter_value() > 5){ time_13 = 5; }
+			else{ time_13 = Potmeter_value();}
+			//time_uitgang[poort_number] = time_uitgang[poort_number] + time_13 * 10 * 60 * 60;
+			break;
+			case 14:
+			time_14 = Potmeter_value();
+			//time_uitgang[poort_number] = time_uitgang[poort_number] + time_14 * 60 * 60;
+			break;
+			case 16:
+			if(Potmeter_value() > 5){ time_16 = 5; }
+			else{ time_16 = Potmeter_value(); }
+			//time_uitgang[poort_number] = time_uitgang[poort_number] + time_16 * 10 * 60;
+			break;
+			case 17:
+			time_17 = Potmeter_value();
+			//time_uitgang[poort_number] = time_uitgang[poort_number] + time_17 * 60;
+			break;
+			case 19:
+			if(Potmeter_value() > 5){ time_19 = 5; }
+			else{ time_19 = Potmeter_value(); }
+			//time_uitgang[poort_number] = time_uitgang[poort_number] + time_19 * 10;
+			break;
+			case 20:
+			time_20 = Potmeter_value();
+			//time_uitgang[poort_number] = time_uitgang[poort_number] + time_20;
+			break;
+		}
+		time_uitgang[poort_number] = (time_10 * 10 + time_11) * 60 * 60 * 60 + (time_13 * 10 + time_14) * 60 * 60 + (time_16 * 10 + time_17) * 60 + (time_19 * 10 + time_20);
+	}
+}
+void display_time(void){
+	
+	for(int pos = 1 ; pos < 5 ; pos++){		//pos komt overeen met poort_nummer
+		dip204_set_cursor_position(1,pos);
+		dip204_write_string("Poort  : --:--:--:--");
+		dip204_set_cursor_position(7,pos);
+		dip204_write_string(itoa(pos));		
+		
+		dip204_set_cursor_position(10,pos);
+		dip204_write_string(itoa((time_uitgang[pos] / 216000) % 24 / 10 % 10));
+		dip204_set_cursor_position(11,pos);
+		dip204_write_string(itoa((time_uitgang[pos] / 216000) % 24 % 10));
+		dip204_set_cursor_position(13,pos);
+		dip204_write_string(itoa((time_uitgang[pos] / 3600) % 60 / 10 % 10));
+		dip204_set_cursor_position(14,pos);
+		dip204_write_string(itoa((time_uitgang[pos] / 3600) % 60 % 10));
+		dip204_set_cursor_position(16,pos);
+		dip204_write_string(itoa((time_uitgang[pos] / 60) % 60 / 10 % 10));
+		dip204_set_cursor_position(17,pos);
+		dip204_write_string(itoa((time_uitgang[pos] / 60) % 60 % 10));
+		dip204_set_cursor_position(19,pos);
+		dip204_write_string(itoa(time_uitgang[pos] % 60 / 10 % 10));
+		dip204_set_cursor_position(20,pos);
+		dip204_write_string(itoa(time_uitgang[pos] % 60 % 10));
+	}
+}
+
+void TWI_MASTER_EEPROM(void){
+	#define EEPROM_ADDRESS        0x57        // EEPROM's TWI address
+	#define EEPROM_ADDR_LGT       3           // Address length of the EEPROM memory
+	#define VIRTUALMEM_ADDR_START 0x123456   // Address of the virtual mem in the EEPROM
+	
+	#define  PATTERN_TEST_LENGTH (sizeof(test_pattern)/sizeof(U8))
+	const U8 test_pattern[] =  { 0xAA, 0x55, 0xA5, 0x5A, 0x77, 0x99 };
+	int status, j;
+
+	U8 data_received[PATTERN_TEST_LENGTH] = {0};
+	
+	print_dbg("\x0C\r\nTWI EEPROM Test\n");
+	gpio_enable_module(TWI_GPIO_MAP, sizeof(TWI_GPIO_MAP) / sizeof(TWI_GPIO_MAP[0]));
+
+	opt.chip = EEPROM_ADDRESS;
+	status = twi_master_init(&AVR32_TWI, &opt);
+
+	if (status == TWI_SUCCESS) { print_dbg("Probe test:\tPASS\r\n"); }
+	else { print_dbg("Probe test:\tFAIL\r\n"); }
+
+	packet_EEPROM_send.chip = EEPROM_ADDRESS;
+	packet_EEPROM_send.addr[0] = VIRTUALMEM_ADDR_START >> 16;
+	packet_EEPROM_send.addr[1] = VIRTUALMEM_ADDR_START >> 8;
+	packet_EEPROM_send.addr[2] = VIRTUALMEM_ADDR_START;
+	packet_EEPROM_send.addr_length = EEPROM_ADDR_LGT;
+	packet_EEPROM_send.buffer = (void*) test_pattern;
+	packet_EEPROM_send.length = PATTERN_TEST_LENGTH;
+
+	status = twi_master_write(&AVR32_TWI, &packet_EEPROM_send);
+
+	if (status == TWI_SUCCESS) { print_dbg("Write test:\tPASS\r\n"); }
+	else { print_dbg("Write test:\tFAIL\r\n"); }
+
+	packet_EEPROM_received.chip = EEPROM_ADDRESS ;
+	packet_EEPROM_received.addr_length = EEPROM_ADDR_LGT;
+	packet_EEPROM_received.length = PATTERN_TEST_LENGTH;
+	packet_EEPROM_received.addr[0] = VIRTUALMEM_ADDR_START >> 16;
+	packet_EEPROM_received.addr[1] = VIRTUALMEM_ADDR_START >> 8;
+	packet_EEPROM_received.addr[2] = VIRTUALMEM_ADDR_START;
+	packet_EEPROM_received.buffer = data_received;
+
+	status = twi_master_read(&AVR32_TWI, &packet_EEPROM_received);
+
+	if (status == TWI_SUCCESS) { print_dbg("Read test:\tPASS\r\n"); }
+	else{ print_dbg("Read test:\tFAIL\r\n"); }
+
+	for (j = 0 ; j < PATTERN_TEST_LENGTH; j++) {
+		if (data_received[j] != test_pattern[j]) {
+			print_dbg("Check Read:\tFAIL\r\n");
+			while(1);
+		}
+	}
+	print_dbg("Check Read:\tPASS\r\n\n");
+}
+void Write_EEPROM(void){	
+	opt.chip = 0x57;
+	twi_master_init(&AVR32_TWI, &opt);
+			
+	U8 write_pattern[] =  { ((time_uitgang[poort_number] / 216000) % 24), ((time_uitgang[poort_number] / 3600) % 60), ((time_uitgang[poort_number] / 60) % 60), (time_uitgang[poort_number] % 60) };
+	
+	packet_EEPROM_send.chip = 0x57;
+	packet_EEPROM_send.addr_length = 3;
+	packet_EEPROM_send.addr[0] = decimal_to_bcd(poort_number);
+	packet_EEPROM_send.addr[1] = 0x00;
+	packet_EEPROM_send.addr[2] = 0x00;
+	packet_EEPROM_send.buffer = (void*) write_pattern;
+	packet_EEPROM_send.length = 4;
+
+	twi_master_write(&AVR32_TWI, &packet_EEPROM_send);
+}
+void Read_EEPROM(void){
+	opt.chip = 0x57;
+	twi_master_init(&AVR32_TWI, &opt);
+	
+	U8 data_received[ 4 ] = {0};
+		
+	for(int j = 1 ; j < 5 ; j++){
+		
+		packet_EEPROM_received.chip = 0x57 ;
+		packet_EEPROM_received.addr_length = 3;
+		packet_EEPROM_received.length = 4;
+		packet_EEPROM_received.addr[0] = decimal_to_bcd(j);
+		packet_EEPROM_received.addr[1] = 0x00;
+		packet_EEPROM_received.addr[2] = 0x00;
+		packet_EEPROM_received.buffer = data_received;
+		int status = twi_master_read(&AVR32_TWI, &packet_EEPROM_received);
+					
+		for(int i = 0; i < 4 ; i ++){	
+			switch(i){
+				case 0:
+				time_uitgang[j] = data_received[i] * 60 * 60 * 60;
+				break;
+				case 1:
+				time_uitgang[j] = time_uitgang[j] + data_received[i] * 60 * 60;
+				break;
+				case 2:
+				time_uitgang[j] = time_uitgang[j] + data_received[i] * 60;
+				break;
+				case 3:
+				time_uitgang[j] = time_uitgang[j] + data_received[i];
+				break;	
+			}
+		}
+		if (status != TWI_SUCCESS) { print_dbg("Read test:\tFAIL\r\n"); }
+		else { var_delay_ms(1); }
+	}
+}
